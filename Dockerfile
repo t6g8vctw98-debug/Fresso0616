@@ -31,7 +31,6 @@ COPY . .
 # SQLite data lives here. On Railway/Render/Fly mount a persistent volume at
 # /app/instance so the DB survives redeploys (see render.yaml / fly.toml).
 RUN mkdir -p /app/instance
-VOLUME ["/app/instance"]
 
 EXPOSE 5001
 
