@@ -1,0 +1,17 @@
+# Don't ship local junk into the image
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+instance/*.db
+instance/.secret_key
+.git
+.gitignore
+*.log
+.DS_Store
+.venv/
+venv/
+tests/
+*.md

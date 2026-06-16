@@ -1,0 +1,30 @@
+# ─── Core web framework ──────────────────────────────────────────────────────
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-SQLAlchemy==3.1.1
+Werkzeug==2.3.7              # pinned to match Flask 2.3.x (avoids 3.x ABI breaks)
+
+# ─── HTTP client ─────────────────────────────────────────────────────────────
+requests==2.31.0
+httpx==0.27.2                # transitive dep of openai>=1.0, pinned for safety
+
+# ─── HTML parsing for recipe extraction ──────────────────────────────────────
+beautifulsoup4==4.12.3
+lxml==5.2.2                  # fast parser used by BeautifulSoup
+
+# ─── Recipe site adapters (optional fallback, kept for future use) ───────────
+recipe-scrapers==15.9.0
+
+# ─── AI / LLM ────────────────────────────────────────────────────────────────
+openai==1.55.3
+
+# ─── Auth / validation ───────────────────────────────────────────────────────
+email-validator==2.2.0       # used in /api/auth/signup
+bcrypt==4.2.0                # if you switch from werkzeug password hashing
+PyJWT==2.9.0                 # if you migrate session tokens to JWT
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+python-dotenv==1.0.0
+
+# ─── Production server ──────────────────────────────────────────────────────
+gunicorn==21.2.0
