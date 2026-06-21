@@ -1667,6 +1667,33 @@ def _pre_normalise_raw_ingredient(text: str) -> str:
         return ''
     s = str(text).strip()
 
+    # 0. Multiplier packs: "2 x 400 g Tins Cherry Tomatoes" -> "800 g Cherry
+    #    Tomatoes". Source sites express tinned/canned goods as count x size.
+    #    Without this the parser took only the count (2) and mis-weighed the
+    #    main ingredient. We fold the multiplier into a single total quantity
+    #    and drop the container word (tin/tins/can/cans/jar/jars/pack(s)).
+    mult = re.match(
+        r'^\s*(\d+(?:\.\d+)?)\s*[x\u00d7\u0445\u0425*]\s*'   # count + x/× (lat/cyr)
+        r'(\d+(?:\.\d+)?)\s*'                                  # pack size number
+        r'(g|gr|gram|grams|kg|mg|oz|ounce|ounces|lb|lbs|ml|milliliter|'
+        r'milliliters|l|liter|liters|litre|litres|cl|dl)\b'      # pack size unit
+        r'\s*(.*)$',
+        s, flags=re.IGNORECASE,
+    )
+    if mult:
+        count = float(mult.group(1))
+        size = float(mult.group(2))
+        unit = mult.group(3)
+        rest = mult.group(4)
+        # Strip a leading container word so the name is clean for USDA lookup.
+        rest = re.sub(
+            r'^(?:of\s+)?(?:tins?|cans?|jars?|packs?|packets?|packages?|'
+            r'bottles?|tubs?|boxes?|box)\s+', '', rest, flags=re.IGNORECASE,
+        ).strip()
+        total = count * size
+        total_str = str(int(total)) if total == int(total) else str(total)
+        s = f"{total_str} {unit} {rest}".strip()
+
     # 1. Strip leading junk punctuation (slashes, bullets, dashes, dots).
     s = re.sub(r'^[\s/\\\-–—·•*°.,;:]+', '', s)
 
@@ -5041,11 +5068,31 @@ _PIECE_WEIGHTS_G = {
     'lemon': 84, 'lemons': 84,
     'egg': 50, 'eggs': 50,
     'onion': 150, 'onions': 150,
+    'red onion': 150, 'red onions': 150,
+    'white onion': 150, 'spring onion': 15, 'spring onions': 15,
+    'shallot': 40, 'shallots': 40,
     'tomato': 123, 'tomatoes': 123,
+    'cherry tomato': 17, 'cherry tomatoes': 17,
     'potato': 213, 'potatoes': 213,
+    'sweet potato': 130, 'sweet potatoes': 130,
     'carrot': 61, 'carrots': 61,
     'garlic clove': 3, 'garlic cloves': 3, 'clove': 3, 'cloves': 3,
+    'garlic': 5,
     'orange': 131, 'oranges': 131,
+    # Peppers & other common veg (previously missing -> ingredients were dropped)
+    'pepper': 120, 'peppers': 120,
+    'red pepper': 120, 'red peppers': 120,
+    'green pepper': 120, 'green peppers': 120,
+    'yellow pepper': 120, 'yellow peppers': 120,
+    'bell pepper': 120, 'bell peppers': 120,
+    'chilli': 15, 'chillies': 15, 'chili': 15, 'chilies': 15,
+    'chilli pepper': 15, 'chili pepper': 15,
+    'courgette': 196, 'courgettes': 196, 'zucchini': 196,
+    'aubergine': 250, 'aubergines': 250, 'eggplant': 250,
+    'cucumber': 300, 'cucumbers': 300,
+    'mushroom': 18, 'mushrooms': 18,
+    'leek': 90, 'leeks': 90,
+    'celery stalk': 40, 'celery stalks': 40, 'celery stick': 40, 'celery sticks': 40,
 }
 
 # Volume conversions to ml (for ingredients given by volume).
@@ -5147,7 +5194,8 @@ def _normalise_ingredient_name(name: str) -> str:
     s = re.sub(
         r'\b(chopped|sliced|diced|minced|grated|crushed|peeled|cooked|raw|'
         r'fresh|frozen|dried|whole|ground|melted|softened|optional|to taste|'
-        r'finely|roughly|coarsely)\b',
+        r'finely|roughly|coarsely|large|small|medium|big|extra|tinned|canned|'
+        r'ripe|skinless|boneless|organic)\b',
         ' ', s
     )
     s = s.replace('-', ' ')
