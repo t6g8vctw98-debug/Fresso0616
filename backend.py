@@ -265,7 +265,8 @@ def parse_quantity(quantity_str):
                 min_val = float(Fraction(range_match.group(1).replace(' ', '+')))
                 max_val = float(Fraction(range_match.group(2).replace(' ', '+')))
                 return (min_val + max_val) / 2, quantity_str
-            except:
+            except (ValueError, ZeroDivisionError):
+                logger.debug("parse_quantity: failed to parse range %r", quantity_str)
                 continue
 
     # Handle mixed numbers (1 1/2)
@@ -275,8 +276,8 @@ def parse_quantity(quantity_str):
             whole = int(mixed_match.group(1))
             frac = float(Fraction(mixed_match.group(2)))
             return whole + frac, quantity_str
-        except:
-            pass
+        except (ValueError, ZeroDivisionError):
+            logger.debug("parse_quantity: failed to parse mixed number %r", quantity_str)
 
     # Handle simple fractions and decimals
     simple_patterns = [
@@ -290,7 +291,8 @@ def parse_quantity(quantity_str):
         if simple_match:
             try:
                 return float(Fraction(simple_match.group(1))), quantity_str
-            except:
+            except (ValueError, ZeroDivisionError):
+                logger.debug("parse_quantity: failed to parse simple value %r", quantity_str)
                 continue
 
     return None, quantity_str
@@ -344,8 +346,8 @@ def format_quantity(value, original_text=""):
             else:
                 # Simple fraction
                 return f"{frac.numerator}/{frac.denominator}"
-    except:
-        pass
+    except (ValueError, ZeroDivisionError, AttributeError):
+        logger.debug("format_quantity: falling back to decimal")
 
     # Fallback to decimal with reasonable precision
     if value < 1:
@@ -548,7 +550,7 @@ try:
     logger.info("[auth-debug] BUILD MARKER: timezone-fix v2 (tokens minted with datetime.now(timezone.utc))")
     del _hl, _fp
 except Exception:
-    pass
+    logger.debug("auth-debug fingerprint logging skipped", exc_info=True)
 
 # ── Database ─────────────────────────────────────────────────────────────────
 # Use absolute path inside Flask's instance folder. Flask uses 3-slash URIs as
@@ -727,8 +729,8 @@ def add_cors_headers(resp):
                 host = urlparse(origin).hostname
                 if host in ('localhost', '127.0.0.1', '::1'):
                     allow = True
-            except Exception:
-                pass
+            except (ValueError, AttributeError):
+                logger.debug("CORS: failed to parse origin %r", origin)
         if allow:
             resp.headers['Access-Control-Allow-Origin'] = origin
             resp.headers.setdefault('Vary', 'Origin')
@@ -1020,6 +1022,14 @@ class Recipe(db.Model):
     dietarytags = db.Column(db.Text)  # JSON string
     language = db.Column(db.String(5))  # Language the recipe text is stored in (ru/en/it/es/fr/de)
 
+    # ── Adaptation lineage ────────────────────────────────────────────────
+    # When a recipe is created by adapting another recipe (servings change,
+    # lactose-free, vegetarian, etc.) we keep a back-reference to the source
+    # recipe id and the list of presets that were applied. Both NULL for
+    # ordinary imported recipes.
+    adaptedfrom = db.Column(db.Integer, db.ForeignKey('recipes.id'), nullable=True, index=True)
+    adaptationpresets = db.Column(db.Text)  # JSON string: list of preset keys applied
+
     # Literary quote fields
     literaryquote = db.Column(db.Text)
     quoteauthor = db.Column(db.String(200))
@@ -1096,7 +1106,9 @@ class Recipe(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'is_saved': self.is_saved,
-            'language': self.language
+            'language': self.language,
+            'adaptedfrom': self.adaptedfrom,
+            'adaptationpresets': json.loads(self.adaptationpresets) if self.adaptationpresets else [],
         }
 
         if include_relationships:
@@ -1377,6 +1389,17 @@ def migrate_database():
                     conn.execute(text("ALTER TABLE recipes ADD COLUMN language VARCHAR(5)"))
                     logger.info("✅ Added recipes.language column")
 
+                # ── Recipe adaptation lineage columns ─────────────────────
+                # Back-reference + applied presets for adapted recipes.
+                if 'adaptedfrom' not in columns:
+                    logger.info("Adding recipes.adaptedfrom column...")
+                    conn.execute(text("ALTER TABLE recipes ADD COLUMN adaptedfrom INTEGER"))
+                    logger.info("✅ Added recipes.adaptedfrom column")
+                if 'adaptationpresets' not in columns:
+                    logger.info("Adding recipes.adaptationpresets column...")
+                    conn.execute(text("ALTER TABLE recipes ADD COLUMN adaptationpresets TEXT"))
+                    logger.info("✅ Added recipes.adaptationpresets column")
+
                 # Check ingredient table for original columns
                 ingredient_columns = [col['name'] for col in inspector.get_columns('ingredients')]
                 if 'originalquantity' not in ingredient_columns:
@@ -1501,7 +1524,8 @@ def normalize_url(url):
         path = parsed.path.rstrip('/')
         normalized = urlunparse((scheme, netloc, path, '', '', ''))
         return normalized
-    except:
+    except (ValueError, AttributeError):
+        logger.debug("normalize_url: failed to normalize %r", url)
         return url.strip().lower()
 def sanitize_image_url(value):
     """Safely extract image URL from various formats"""
@@ -1545,7 +1569,7 @@ def sanitize_json_field(value):
         try:
             json.loads(value)
             return value
-        except:
+        except (ValueError, TypeError):
             return json.dumps([value])
     if isinstance(value, (list, dict)):
         return json.dumps(value)
@@ -1602,7 +1626,8 @@ def extract_servings(text):
         if matches:
             return int(matches[0])
         return 4
-    except:
+    except (ValueError, TypeError):
+        logger.debug("extract_servings: failed to parse %r", text)
         return 4
 
 # Known cooking units. Only these are treated as units; anything else after the
@@ -3737,7 +3762,8 @@ def extract_recipe():
             try:
                 clean_ingredients = enhance_text_with_ai(raw_ingredients, "ingredients")
                 clean_instructions = enhance_text_with_ai(raw_instructions, "instructions")
-            except:
+            except Exception:
+                logger.warning("AI text cleanup failed; using raw ingredients/instructions", exc_info=True)
                 clean_ingredients = raw_ingredients
                 clean_instructions = raw_instructions
         else:
@@ -4542,9 +4568,11 @@ def recipe_detail(recipe_id):
         return jsonify({'error': 'Access denied'}), 403
 
     if request.method == 'GET':
+        payload = recipe.to_dict()
+        payload['pantry_match'] = compute_pantry_match(recipe)
         return jsonify({
             'success': True,
-            'recipe': recipe.to_dict()
+            'recipe': payload
         })
 
     elif request.method == 'PUT':  # ADD THIS ENTIRE BLOCK
@@ -5130,6 +5158,95 @@ _WEIGHT_TO_G = {
     'lb': 453.59, 'lbs': 453.59, 'pound': 453.59, 'pounds': 453.59,
 }
 
+# ── Shopping-list unit reconciliation ─────────────────────────────────────────
+# These tables let the SHOPPING LIST merge two lines of the same ingredient that
+# were written in different units (e.g. "2 cup flour" + "100 g flour"). They are
+# used ONLY for the aggregated shopping list. They never mutate a recipe's stored
+# Ingredient rows, so cooking/scaling still use the original recipe quantities.
+#
+# Each unit belongs to a "dimension": 'mass', 'volume', or 'count'. We only ever
+# merge units that share a dimension. Cross-dimension merges (e.g. grams of flour
+# vs cups of flour) are attempted ONLY when we have a trusted density for that
+# specific ingredient; otherwise the two lines are kept separate (safe fallback).
+
+# Canonical display unit + step ladder per dimension, largest-first. When the
+# merged total in the base unit (g or ml) is large enough, we promote it to a
+# friendlier unit for display (e.g. 1500 g -> "1.5 kg").
+_MASS_DISPLAY_LADDER = [('kg', 1000.0), ('g', 1.0)]
+_VOLUME_DISPLAY_LADDER = [('l', 1000.0), ('ml', 1.0)]
+
+
+def _unit_dimension(unit: str) -> Optional[str]:
+    """Classify a raw unit string into 'mass', 'volume', 'count', or None.
+
+    None means "unitless / unknown" (e.g. 'to taste', 'pinch', '') — such lines
+    are never auto-converted; they merge only on an exact unit-string match.
+    """
+    u = (unit or '').lower().strip().rstrip('.')
+    if not u:
+        return None
+    if u in _WEIGHT_TO_G:
+        return 'mass'
+    if u in _VOLUME_TO_ML:
+        return 'volume'
+    if u in {'piece', 'pieces', 'pcs', 'pc', 'whole', 'unit', 'units'}:
+        return 'count'
+    return None
+
+
+def _to_base_amount(qty: float, unit: str) -> Optional[tuple]:
+    """Convert (qty, unit) to a (base_amount, dimension) pair.
+
+    Mass   -> grams,      dimension 'mass'
+    Volume -> millilitres, dimension 'volume'
+    Count  -> pieces,     dimension 'count'
+    Returns None if the unit isn't convertible.
+    """
+    u = (unit or '').lower().strip().rstrip('.')
+    if u in _WEIGHT_TO_G:
+        return (qty * _WEIGHT_TO_G[u], 'mass')
+    if u in _VOLUME_TO_ML:
+        return (qty * _VOLUME_TO_ML[u], 'volume')
+    if u in {'piece', 'pieces', 'pcs', 'pc', 'whole', 'unit', 'units'}:
+        return (qty, 'count')
+    return None
+
+
+def _ingredient_density(name_norm: str) -> Optional[float]:
+    """Return a trusted g/ml density for an ingredient, or None if unknown.
+
+    Unlike _ingredient_grams (which falls back to water=1.0 for nutrition
+    estimates), here we return None when we are NOT confident, because a wrong
+    density would silently corrupt a shopping quantity. Only known ingredients
+    get a cross-unit (mass<->volume) merge.
+    """
+    if name_norm in _INGREDIENT_DENSITY:
+        return _INGREDIENT_DENSITY[name_norm]
+    for key, dens in _INGREDIENT_DENSITY.items():
+        if name_norm.endswith(key):
+            return dens
+    return None
+
+
+def _format_base_amount(base_amount: float, dimension: str) -> tuple:
+    """Turn a base amount (g / ml / pieces) into a friendly (qty_str, unit)."""
+    def _fmt(v: float) -> str:
+        return (str(int(round(v))) if abs(v - round(v)) < 1e-6
+                else f'{v:.2f}'.rstrip('0').rstrip('.'))
+
+    if dimension == 'mass':
+        for unit, factor in _MASS_DISPLAY_LADDER:
+            if base_amount >= factor:
+                return (_fmt(base_amount / factor), unit)
+        return (_fmt(base_amount), 'g')
+    if dimension == 'volume':
+        for unit, factor in _VOLUME_DISPLAY_LADDER:
+            if base_amount >= factor:
+                return (_fmt(base_amount / factor), unit)
+        return (_fmt(base_amount), 'ml')
+    # count
+    return (_fmt(base_amount), 'pcs')
+
 
 class NutritionCache(db.Model):
     """Cache USDA lookups so we don't hit the API for every recipe view.
@@ -5391,8 +5508,8 @@ def _to_english_ingredient(name: str) -> str:
     try:
         if name.isascii():
             return name
-    except Exception:
-        pass
+    except (AttributeError, TypeError):
+        logger.debug("ingredient EN translate: isascii check failed for %r", name)
 
     # 2) LLM translation to a single canonical English ingredient name
     #    (handles non-ASCII names like Cyrillic that aren't in the dictionary).
@@ -5781,21 +5898,214 @@ class ShoppingListItem(db.Model):
             'unit':       self.unit,
             'checked':    bool(self.checked),
             'source_recipes': sources,
+            'category':    categorize_ingredient(self.ingredient),
+        }
+
+
+# ── Grocery category classification (offline RU+EN keyword dictionary) ────────
+# Maps a normalised ingredient name to one of the smart-list aisles. Unknown
+# items fall back to 'other'. Keys are substrings matched against the
+# normalised name; first matching category wins (checked in CATEGORY_ORDER).
+GROCERY_CATEGORIES = ('vegetables', 'fruits', 'dairy', 'meat', 'pantry', 'other')
+
+GROCERY_KEYWORDS = {
+    'vegetables': [
+        # EN
+        'tomato', 'onion', 'garlic', 'potato', 'carrot', 'pepper', 'cucumber',
+        'lettuce', 'spinach', 'broccoli', 'cabbage', 'zucchini', 'mushroom',
+        'celery', 'corn', 'pea', 'bean sprout', 'eggplant', 'aubergine',
+        'pumpkin', 'beet', 'radish', 'leek', 'scallion', 'kale', 'cauliflower',
+        'green bean', 'asparagus', 'chili', 'chilli', 'ginger', 'herb',
+        'parsley', 'cilantro', 'basil', 'dill', 'mint',
+        # RU
+        'помидор', 'томат', 'лук', 'чеснок', 'картоф', 'морков', 'перец',
+        'огурец', 'огурц', 'салат', 'шпинат', 'брокколи', 'капуст', 'кабач',
+        'гриб', 'шампиньон', 'сельдерей', 'кукуруз', 'горош', 'баклажан',
+        'тыкв', 'свекл', 'редис', 'порей', 'зелен', 'петрушк', 'кинз',
+        'базилик', 'укроп', 'мят', 'имбир', 'цветная капуста', 'спарж',
+    ],
+    'fruits': [
+        'apple', 'banana', 'orange', 'lemon', 'lime', 'berry', 'strawberry',
+        'blueberry', 'raspberry', 'grape', 'pear', 'peach', 'mango', 'pineapple',
+        'avocado', 'cherry', 'melon', 'kiwi', 'apricot', 'plum', 'pomegranate',
+        'яблок', 'банан', 'апельсин', 'лимон', 'лайм', 'ягод', 'клубник',
+        'черник', 'малин', 'виноград', 'груш', 'персик', 'манго', 'ананас',
+        'авокадо', 'вишн', 'черешн', 'дын', 'арбуз', 'киви', 'абрикос', 'слив',
+        'гранат', 'смородин',
+    ],
+    'dairy': [
+        'milk', 'cream', 'butter', 'cheese', 'yogurt', 'yoghurt', 'curd',
+        'sour cream', 'mozzarella', 'parmesan', 'cheddar', 'feta', 'ricotta',
+        'egg', 'kefir', 'mascarpone',
+        'молок', 'молоч', 'сливк', 'масл', 'сыр', 'йогурт', 'творог',
+        'сметан', 'моцарелл', 'пармезан', 'чеддер', 'фет', 'рикотт', 'яйц',
+        'яйца', 'кефир', 'маскарпоне',
+    ],
+    'meat': [
+        'chicken', 'beef', 'pork', 'lamb', 'turkey', 'bacon', 'sausage', 'ham',
+        'mince', 'steak', 'fish', 'salmon', 'tuna', 'shrimp', 'prawn', 'cod',
+        'meat', 'fillet', 'duck', 'veal', 'seafood', 'anchov',
+        'куриц', 'куриное', 'курин', 'говядин', 'свинин', 'баранин', 'индейк',
+        'бекон', 'колбас', 'сосиск', 'ветчин', 'фарш', 'стейк', 'рыб', 'лосос',
+        'тунец', 'креветк', 'треск', 'мяс', 'филе', 'утк', 'телятин',
+        'морепродукт', 'анчоус',
+    ],
+    'pantry': [
+        'flour', 'sugar', 'salt', 'pepper', 'oil', 'vinegar', 'rice', 'pasta',
+        'noodle', 'bread', 'oat', 'cereal', 'honey', 'syrup', 'sauce', 'paste',
+        'stock', 'broth', 'spice', 'baking', 'yeast', 'soda', 'cocoa',
+        'chocolate', 'vanilla', 'cinnamon', 'nut', 'almond', 'walnut', 'seed',
+        'lentil', 'chickpea', 'bean', 'canned', 'tinned', 'soy', 'mustard',
+        'ketchup', 'mayo', 'water', 'wine', 'coffee', 'tea',
+        'мук', 'сахар', 'сол', 'масло растит', 'уксус', 'рис', 'макарон',
+        'паст', 'лапш', 'хлеб', 'овсян', 'хлоп', 'мёд', 'мед', 'сироп',
+        'соус', 'бульон', 'специ', 'припр', 'дрожж', 'сод', 'какао',
+        'шоколад', 'ванил', 'корица', 'орех', 'миндал', 'грецк', 'семеч',
+        'чечевиц', 'нут', 'фасол', 'консерв', 'соев', 'горчиц', 'кетчуп',
+        'майонез', 'вод', 'вино', 'кофе', 'чай', 'крупа', 'греч',
+    ],
+}
+
+
+# High-priority phrase overrides, checked BEFORE the broad keyword scan. These
+# fix common substring false-positives where a compound word contains a keyword
+# for a different aisle (e.g. "vegetable oil" contains the dairy keyword "oil"
+# via RU "масл", "black pepper" contains the veg keyword "pepper",
+# "chicken stock" contains the meat keyword "chicken" but is really a pantry
+# staple, "coconut milk" contains the dairy keyword "milk"). First match wins.
+GROCERY_OVERRIDES = [
+    # Cooking oils -> pantry (must beat dairy 'oil'/RU 'масл').
+    ('vegetable oil', 'pantry'), ('olive oil', 'pantry'), ('sunflower oil', 'pantry'),
+    ('coconut oil', 'pantry'), ('sesame oil', 'pantry'), ('canola oil', 'pantry'),
+    ('растительное масло', 'pantry'), ('масло растит', 'pantry'),
+    ('оливковое масло', 'pantry'), ('подсолнечное масло', 'pantry'),
+    ('подсолнечн', 'pantry'), ('кокосовое масло', 'pantry'),
+    ('кунжутное масло', 'pantry'), ('растительн', 'pantry'),
+    # Plant 'milks' & creams -> pantry (must beat dairy 'milk'/RU 'молок').
+    ('coconut milk', 'pantry'), ('almond milk', 'pantry'), ('soy milk', 'pantry'),
+    ('oat milk', 'pantry'), ('rice milk', 'pantry'), ('coconut cream', 'pantry'),
+    ('кокосовое молоко', 'pantry'), ('миндальное молоко', 'pantry'),
+    ('соевое молоко', 'pantry'), ('овсяное молоко', 'pantry'),
+    # Spices/condiments with veg/meat keyword substrings -> pantry.
+    ('black pepper', 'pantry'), ('white pepper', 'pantry'), ('peppercorn', 'pantry'),
+    ('cayenne pepper', 'pantry'), ('red pepper flake', 'pantry'),
+    ('черный перец', 'pantry'), ('чёрный перец', 'pantry'), ('перец черный', 'pantry'),
+    ('перец чёрный', 'pantry'), ('перец горошком', 'pantry'), ('душистый перец', 'pantry'),
+    ('паприка', 'pantry'),
+    # Stocks / broths / fish sauce -> pantry (beat meat 'chicken'/'beef'/'fish').
+    ('chicken stock', 'pantry'), ('beef stock', 'pantry'), ('vegetable stock', 'pantry'),
+    ('fish stock', 'pantry'), ('chicken broth', 'pantry'), ('beef broth', 'pantry'),
+    ('vegetable broth', 'pantry'), ('fish sauce', 'pantry'), ('oyster sauce', 'pantry'),
+    ('bouillon', 'pantry'), ('stock cube', 'pantry'),
+    ('куриный бульон', 'pantry'), ('говяжий бульон', 'pantry'),
+    ('овощной бульон', 'pantry'), ('бульонный кубик', 'pantry'),
+    ('рыбный соус', 'pantry'), ('устричный соус', 'pantry'), ('бульон', 'pantry'),
+    # 'butter' compounds that aren't dairy.
+    ('peanut butter', 'pantry'), ('almond butter', 'pantry'), ('nut butter', 'pantry'),
+    ('cocoa butter', 'pantry'), ('butter bean', 'pantry'), ('butternut', 'vegetables'),
+    ('арахисовое масло', 'pantry'), ('ореховая паста', 'pantry'),
+    # 'corn' compounds that are pantry staples (beat veg 'corn').
+    ('cornstarch', 'pantry'), ('corn starch', 'pantry'), ('corn flour', 'pantry'),
+    ('cornmeal', 'pantry'), ('popcorn', 'pantry'), ('corn syrup', 'pantry'),
+    ('кукурузный крахмал', 'pantry'), ('кукурузная мука', 'pantry'),
+    ('кукурузный сироп', 'pantry'), ('попкорн', 'pantry'),
+    # 'bean' compounds that are pantry (beat veg; 'green bean' stays veg below).
+    ('vanilla bean', 'pantry'), ('coffee bean', 'pantry'), ('cocoa bean', 'pantry'),
+    ('ванильный стручок', 'pantry'), ('кофейные зёрна', 'pantry'),
+    ('кофейные зерна', 'pantry'),
+    # 'egg' compounds that aren't dairy.
+    ('egg noodle', 'pantry'), ('eggplant', 'vegetables'), ('баклажан', 'vegetables'),
+    # Keep these as veg even though they contain other keywords.
+    ('green bean', 'vegetables'), ('bell pepper', 'vegetables'),
+    ('болгарский перец', 'vegetables'), ('сладкий перец', 'vegetables'),
+    ('стручковая фасоль', 'vegetables'), ('зеленая фасоль', 'vegetables'),
+    ('зелёная фасоль', 'vegetables'),
+]
+
+
+def categorize_ingredient(name: str) -> str:
+    """Classify an ingredient name into a grocery aisle using the keyword dict.
+
+    First, high-priority phrase overrides are checked (GROCERY_OVERRIDES) to
+    resolve common substring false-positives (e.g. "vegetable oil" is pantry,
+    not dairy). Then matching falls back to the broad keyword dict: the first
+    category in the order meat, dairy, vegetables, fruits, pantry with a
+    matching keyword wins so that e.g. protein words beat the 'stock'/'sauce'
+    pantry keywords. Unknown -> 'other'.
+    """
+    norm = _normalise_ingredient_name(name or '')
+    if not norm:
+        return 'other'
+    raw = (name or '').lower()
+    # 1) Phrase overrides (first match wins).
+    for phrase, cat in GROCERY_OVERRIDES:
+        if phrase in norm or phrase in raw:
+            return cat
+    # 2) Broad keyword scan. Order matters: protein words should win over the
+    # 'stock'/'sauce' pantry keywords, and dairy 'egg' should win generically.
+    for cat in ('meat', 'dairy', 'vegetables', 'fruits', 'pantry'):
+        for kw in GROCERY_KEYWORDS[cat]:
+            if kw in norm or kw in raw:
+                return cat
+    return 'other'
+
+
+class PantryItem(db.Model):
+    """A product the user currently has at home (manual pantry inventory).
+
+    Matching against recipe ingredients is done by normalised name only
+    (no quantity comparison). Categories are auto-assigned via
+    categorize_ingredient on create/update.
+    """
+    __tablename__ = 'pantry_items'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'),
+                        nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    quantity = db.Column(db.String(50))
+    unit = db.Column(db.String(50))
+    category = db.Column(db.String(50), default='other')
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'quantity': self.quantity or '',
+            'unit': self.unit or '',
+            'category': self.category or 'other',
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
 def _aggregate_ingredients_for_list(recipe_ids: list, owner_id: int) -> list:
-    """Pull ingredients from each recipe and merge by (name, unit).
+    """Pull ingredients from each recipe and merge them for a shopping list.
 
-    Algorithm:
+    Unit-aware merge algorithm (shopping list ONLY — never touches recipes):
       1. For each recipe owned by owner_id, iterate its Ingredient rows.
       2. Normalise name (lower, trim, drop prep words).
-      3. Bucket by (normalised_name, unit).
-      4. Sum quantities when both are numeric and units match exactly.
-      5. If quantities aren't numeric (e.g. "to taste"), keep first occurrence
-         and append source recipe IDs.
+      3. Convert the (qty, unit) pair to a base amount + dimension:
+           mass -> grams, volume -> ml, count -> pieces.
+      4. Bucket convertible lines by (name, dimension) and SUM in the base
+         unit, so "2 cup flour" + "100 g flour" land in the same mass bucket
+         once a trusted density bridges volume->mass.
+      5. Non-convertible lines (no/unknown unit, 'to taste', 'pinch') fall back
+         to the legacy (name, exact-unit) bucketing — never auto-converted.
+      6. Lines whose quantity isn't numeric keep their textual quantity.
+      7. Re-format each merged total to a friendly unit (1500 g -> "1.5 kg").
+
+    Safety: recipe Ingredient rows are read-only here. The conversion output is
+    used purely to build the shopping list; cooking and serving-scaling continue
+    to use the original recipe quantities.
     """
-    buckets: dict[tuple[str, str], dict] = {}
+    # Two bucket spaces:
+    #   dim_buckets: keyed (name, dimension) -> accumulates base_amount
+    #   raw_buckets: keyed (name, exact_unit) -> legacy text/exact-unit merge
+    dim_buckets: dict[tuple, dict] = {}
+    raw_buckets: dict[tuple, dict] = {}
 
     for rid in recipe_ids:
         recipe = Recipe.query.filter_by(id=rid, user_id=owner_id).first()
@@ -5803,32 +6113,68 @@ def _aggregate_ingredients_for_list(recipe_ids: list, owner_id: int) -> list:
             continue
         for ing in recipe.ingredients:
             name_key = _normalise_ingredient_name(ing.ingredient)
-            unit_key = (ing.unit or '').lower().strip()
             if not name_key:
                 continue
-            key = (name_key, unit_key)
             qty_value = _parse_quantity_to_float(ing.quantity)
+            unit_raw = ing.unit or ''
+            base = _to_base_amount(qty_value, unit_raw) if qty_value is not None else None
 
-            if key not in buckets:
-                buckets[key] = {
+            # ---- Path A: convertible numeric line (mass/volume/count) --------
+            if base is not None:
+                base_amount, dimension = base
+                # Volume lines are folded into the MASS dimension only when we
+                # have a trusted density for this ingredient; otherwise they
+                # stay in their own volume dimension (safe — no guessed density).
+                if dimension == 'volume':
+                    dens = _ingredient_density(name_key)
+                    if dens is not None:
+                        base_amount, dimension = base_amount * dens, 'mass'
+                key = (name_key, dimension)
+                if key not in dim_buckets:
+                    dim_buckets[key] = {
+                        'ingredient': ing.ingredient.strip(),
+                        'base_amount': base_amount,
+                        'dimension': dimension,
+                        'sources': [recipe.id],
+                    }
+                else:
+                    b = dim_buckets[key]
+                    b['base_amount'] += base_amount
+                    if recipe.id not in b['sources']:
+                        b['sources'].append(recipe.id)
+                continue
+
+            # ---- Path B: non-convertible / textual line (legacy merge) ------
+            unit_key = unit_raw.lower().strip()
+            key = (name_key, unit_key)
+            if key not in raw_buckets:
+                raw_buckets[key] = {
                     'ingredient': ing.ingredient.strip(),
                     'quantity_numeric': qty_value,
                     'quantity_text': ing.quantity if qty_value is None else None,
-                    'unit': ing.unit or '',
+                    'unit': unit_raw,
                     'sources': [recipe.id],
                 }
             else:
-                bucket = buckets[key]
-                if qty_value is not None and bucket['quantity_numeric'] is not None:
-                    bucket['quantity_numeric'] += qty_value
-                elif qty_value is not None and bucket['quantity_numeric'] is None:
-                    bucket['quantity_numeric'] = qty_value
-                # Otherwise we leave the textual quantity as-is.
-                if recipe.id not in bucket['sources']:
-                    bucket['sources'].append(recipe.id)
+                b = raw_buckets[key]
+                if qty_value is not None and b['quantity_numeric'] is not None:
+                    b['quantity_numeric'] += qty_value
+                elif qty_value is not None and b['quantity_numeric'] is None:
+                    b['quantity_numeric'] = qty_value
+                if recipe.id not in b['sources']:
+                    b['sources'].append(recipe.id)
 
     items = []
-    for (name_key, unit_key), b in buckets.items():
+    for b in dim_buckets.values():
+        qty_str, unit = _format_base_amount(b['base_amount'], b['dimension'])
+        items.append({
+            'ingredient': b['ingredient'],
+            'quantity':   qty_str,
+            'unit':       unit,
+            'sources':    b['sources'],
+            'category':   categorize_ingredient(b['ingredient']),
+        })
+    for b in raw_buckets.values():
         if b['quantity_numeric'] is not None:
             qv = b['quantity_numeric']
             qty_str = (str(int(qv)) if abs(qv - round(qv)) < 1e-6 else f'{qv:.2f}'.rstrip('0').rstrip('.'))
@@ -5839,6 +6185,7 @@ def _aggregate_ingredients_for_list(recipe_ids: list, owner_id: int) -> list:
             'quantity':   qty_str,
             'unit':       b['unit'],
             'sources':    b['sources'],
+            'category':   categorize_ingredient(b['ingredient']),
         })
     items.sort(key=lambda it: it['ingredient'].lower())
     return items
@@ -6063,6 +6410,960 @@ def api_shopping_list_from_recipes():
 
     db.session.commit()
     return jsonify({'success': True, 'shopping_list': sl.to_dict()}), 201
+
+
+# ── Weekly Meal Planner ───────────────────────────────────────────────────────
+# A meal plan is a flat collection of entries. One entry = (user, date, slot,
+# recipe). Multiple recipes per slot are allowed (e.g. side + main), so the
+# unique key includes recipe_id. The frontend groups entries into a 7-day x
+# 3-slot grid. Weeks start on Monday.
+
+MEAL_SLOTS = ('breakfast', 'lunch', 'dinner')
+
+
+class MealPlanEntry(db.Model):
+    __tablename__ = 'meal_plan_entries'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    recipe_id = db.Column(db.Integer, db.ForeignKey('recipes.id'), nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    slot = db.Column(db.String(20), nullable=False)  # breakfast | lunch | dinner
+    position = db.Column(db.Integer, default=0)       # order within a slot
+    created_at = db.Column(db.DateTime, default=utcnow)
+
+    recipe = db.relationship('Recipe', lazy='joined')
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'date', 'slot', 'recipe_id',
+                            name='uq_meal_plan_entry'),
+    )
+
+    def to_dict(self):
+        r = self.recipe
+        recipe_card = None
+        if r is not None:
+            recipe_card = {
+                'id': r.id,
+                'title': r.title,
+                'imageurl': r.imageurl,
+                'totaltime': r.totaltime or ((r.preptime or 0) + (r.cooktime or 0)),
+                'servings': r.servings,
+            }
+        return {
+            'id': self.id,
+            'recipe_id': self.recipe_id,
+            'date': self.date.isoformat() if self.date else None,
+            'slot': self.slot,
+            'position': self.position,
+            'recipe': recipe_card,
+        }
+
+
+def _parse_date(value, field='date'):
+    """Parse a YYYY-MM-DD string into a date, or return (None, error_response)."""
+    if not value:
+        return None, (jsonify({'error': f'{field} is required (YYYY-MM-DD)'}), 400)
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date(), None
+    except (ValueError, TypeError):
+        return None, (jsonify({'error': f'{field} must be YYYY-MM-DD'}), 400)
+
+
+def _monday_of(d):
+    """Return the Monday (week start) for the week containing date d."""
+    return d - timedelta(days=d.weekday())
+
+
+@app.route('/api/meal-plans', methods=['GET', 'POST'])
+@require_auth
+def api_meal_plans():
+    user = request.current_user
+
+    if request.method == 'GET':
+        # ?week_start=YYYY-MM-DD (defaults to current week's Monday).
+        ws_str = request.args.get('week_start')
+        if ws_str:
+            week_start, err = _parse_date(ws_str, 'week_start')
+            if err:
+                return err
+            week_start = _monday_of(week_start)
+        else:
+            week_start = _monday_of(datetime.now(timezone.utc).date())
+        week_end = week_start + timedelta(days=6)
+
+        entries = (
+            MealPlanEntry.query
+            .filter(
+                MealPlanEntry.user_id == user.id,
+                MealPlanEntry.date >= week_start,
+                MealPlanEntry.date <= week_end,
+            )
+            .order_by(MealPlanEntry.date.asc(), MealPlanEntry.position.asc())
+            .all()
+        )
+        return jsonify({
+            'success': True,
+            'week_start': week_start.isoformat(),
+            'week_end': week_end.isoformat(),
+            'entries': [e.to_dict() for e in entries],
+        })
+
+    # POST: add a recipe to a (date, slot).
+    data = request.get_json(silent=True) or {}
+    date_val, err = _parse_date(data.get('date'))
+    if err:
+        return err
+    slot = (data.get('slot') or '').strip().lower()
+    if slot not in MEAL_SLOTS:
+        return jsonify({'error': f'slot must be one of {list(MEAL_SLOTS)}'}), 400
+    recipe_id = data.get('recipe_id')
+    if not recipe_id:
+        return jsonify({'error': 'recipe_id is required'}), 400
+
+    recipe = Recipe.query.filter_by(id=recipe_id, user_id=user.id).first()
+    if recipe is None:
+        return jsonify({'error': 'recipe not found'}), 404
+
+    # Idempotent: if this recipe is already in the slot, return it.
+    existing = MealPlanEntry.query.filter_by(
+        user_id=user.id, date=date_val, slot=slot, recipe_id=recipe_id
+    ).first()
+    if existing is not None:
+        return jsonify({'success': True, 'entry': existing.to_dict()}), 200
+
+    count = MealPlanEntry.query.filter_by(
+        user_id=user.id, date=date_val, slot=slot
+    ).count()
+    entry = MealPlanEntry(
+        user_id=user.id, recipe_id=recipe_id, date=date_val,
+        slot=slot, position=count,
+    )
+    db.session.add(entry)
+    db.session.commit()
+    return jsonify({'success': True, 'entry': entry.to_dict()}), 201
+
+
+@app.route('/api/meal-plans/<int:entry_id>', methods=['DELETE'])
+@require_auth
+def api_meal_plan_delete(entry_id):
+    user = request.current_user
+    entry = MealPlanEntry.query.filter_by(id=entry_id, user_id=user.id).first()
+    if entry is None:
+        return jsonify({'error': 'entry not found'}), 404
+    db.session.delete(entry)
+    db.session.commit()
+    return jsonify({'success': True}), 200
+
+
+def _copy_entries(user_id, src_entries, date_mapper):
+    """Copy a set of entries onto new dates, skipping duplicates.
+
+    date_mapper: callable(old_date) -> new_date.
+    Returns the number of entries created.
+    """
+    created = 0
+    for e in src_entries:
+        new_date = date_mapper(e.date)
+        exists = MealPlanEntry.query.filter_by(
+            user_id=user_id, date=new_date, slot=e.slot, recipe_id=e.recipe_id
+        ).first()
+        if exists is not None:
+            continue
+        count = MealPlanEntry.query.filter_by(
+            user_id=user_id, date=new_date, slot=e.slot
+        ).count()
+        db.session.add(MealPlanEntry(
+            user_id=user_id, recipe_id=e.recipe_id, date=new_date,
+            slot=e.slot, position=count,
+        ))
+        created += 1
+    return created
+
+
+@app.route('/api/meal-plans/copy-day', methods=['POST'])
+@require_auth
+def api_meal_plan_copy_day():
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    from_date, err = _parse_date(data.get('from_date'), 'from_date')
+    if err:
+        return err
+    to_date, err = _parse_date(data.get('to_date'), 'to_date')
+    if err:
+        return err
+
+    src = MealPlanEntry.query.filter_by(user_id=user.id, date=from_date).all()
+    created = _copy_entries(user.id, src, lambda _d: to_date)
+    db.session.commit()
+    return jsonify({'success': True, 'copied': created}), 200
+
+
+@app.route('/api/meal-plans/copy-week', methods=['POST'])
+@require_auth
+def api_meal_plan_copy_week():
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    from_ws, err = _parse_date(data.get('from_week_start'), 'from_week_start')
+    if err:
+        return err
+    to_ws, err = _parse_date(data.get('to_week_start'), 'to_week_start')
+    if err:
+        return err
+    from_ws = _monday_of(from_ws)
+    to_ws = _monday_of(to_ws)
+    offset = (to_ws - from_ws).days
+
+    src = MealPlanEntry.query.filter(
+        MealPlanEntry.user_id == user.id,
+        MealPlanEntry.date >= from_ws,
+        MealPlanEntry.date <= from_ws + timedelta(days=6),
+    ).all()
+    created = _copy_entries(user.id, src, lambda d: d + timedelta(days=offset))
+    db.session.commit()
+    return jsonify({'success': True, 'copied': created,
+                    'to_week_start': to_ws.isoformat()}), 200
+
+
+@app.route('/api/meal-plans/shopping-list', methods=['POST'])
+@require_auth
+def api_meal_plan_shopping_list():
+    """Build a shopping list from all recipes planned in a given week."""
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    week_start, err = _parse_date(data.get('week_start'), 'week_start')
+    if err:
+        return err
+    week_start = _monday_of(week_start)
+    week_end = week_start + timedelta(days=6)
+
+    entries = MealPlanEntry.query.filter(
+        MealPlanEntry.user_id == user.id,
+        MealPlanEntry.date >= week_start,
+        MealPlanEntry.date <= week_end,
+    ).all()
+    recipe_ids = list({e.recipe_id for e in entries})
+    if not recipe_ids:
+        return jsonify({'error': 'no recipes planned for this week'}), 400
+
+    aggregated = _aggregate_ingredients_for_list(recipe_ids, user.id)
+    name = (data.get('name') or f'Week of {week_start.isoformat()}').strip()
+    sl = ShoppingList(user_id=user.id, name=name, target_date=week_start)
+    db.session.add(sl)
+    db.session.flush()
+    for item in aggregated:
+        sl.items.append(ShoppingListItem(
+            ingredient=item['ingredient'],
+            quantity=item['quantity'],
+            unit=item['unit'],
+            checked=False,
+            source_recipes=json.dumps(item['sources']),
+        ))
+    db.session.commit()
+    return jsonify({'success': True, 'shopping_list': sl.to_dict()}), 201
+
+
+# =============================================================================
+# RECIPE ADAPTATION
+# -----------------------------------------------------------------------------
+# Turns an existing recipe into a variant tailored to a household task:
+#   • serving size (2 / 4 / 6)  → scaled ALGORITHMICALLY (free, instant, exact)
+#   • dietary / goal presets    → rewritten via OpenAI, then nutrients recomputed
+# The endpoint returns a PREVIEW (never persists). A separate /save endpoint
+# stores an accepted preview as a NEW recipe linked to the original.
+# Presets are multi-select and can be combined in a single request.
+# =============================================================================
+
+# Allowed serving targets for the algorithmic scaler.
+ADAPT_SERVING_TARGETS = (2, 4, 6)
+
+# LLM-driven presets. `key` is the stable id stored on the recipe and sent by
+# the client; `instruction` is the natural-language directive injected into the
+# prompt. Order here defines the order they are described to the model.
+ADAPT_PRESETS = {
+    'lactose_free': {
+        'instruction': (
+            "Make the recipe LACTOSE-FREE. Replace milk, cream, butter, cheese, "
+            "yogurt and other dairy with lactose-free or plant-based equivalents "
+            "(e.g. lactose-free milk, plant milk, vegan butter, lactose-free cheese). "
+            "Keep flavor and texture as close to the original as possible."
+        ),
+    },
+    'vegetarian': {
+        'instruction': (
+            "Make the recipe VEGETARIAN. Remove all meat, poultry and fish and "
+            "replace them with vegetarian protein sources (legumes, tofu, mushrooms, "
+            "eggs, dairy) that fit the dish. Eggs and dairy are allowed."
+        ),
+    },
+    'high_protein': {
+        'instruction': (
+            "Make the recipe HIGHER IN PROTEIN. Increase protein-rich ingredients "
+            "and/or add suitable protein sources without changing the character of "
+            "the dish. Adjust other ingredients to keep the recipe balanced."
+        ),
+    },
+    'lower_calorie': {
+        'instruction': (
+            "Make the recipe LOWER IN CALORIES. Reduce or substitute high-calorie "
+            "ingredients (oils, fats, sugar, cream) with lighter alternatives and "
+            "lighter cooking methods, while keeping the dish satisfying."
+        ),
+    },
+    'faster': {
+        'instruction': (
+            "Make the recipe FASTER to cook. Simplify steps, use quicker techniques "
+            "or shortcut ingredients, and reduce total time. Keep the result tasty. "
+            "Update preptime/cooktime/totaltime to realistic smaller values."
+        ),
+    },
+    'cheaper': {
+        'instruction': (
+            "Make the recipe CHEAPER. Replace expensive ingredients with affordable, "
+            "widely available substitutes that keep the dish recognizable and tasty."
+        ),
+    },
+    'gluten_free': {
+        'instruction': (
+            "Make the recipe GLUTEN-FREE. Replace wheat flour, breadcrumbs, pasta, "
+            "soy sauce and other gluten sources with certified gluten-free "
+            "alternatives. Keep texture and taste close to the original."
+        ),
+    },
+    'pantry': {
+        # Special preset: requires the `pantry` free-text field from the client.
+        # Its instruction is built dynamically in adapt_recipe_fields().
+        'instruction': None,
+    },
+}
+
+# Presets that change the recipe text and therefore require an OpenAI call.
+LLM_ADAPT_PRESETS = tuple(ADAPT_PRESETS.keys())
+
+
+def adapt_recipe_fields(recipe: dict, presets: list, pantry: str = '', target_lang: str = 'ru') -> dict:
+    """Rewrite a recipe's text to satisfy one or more dietary/goal presets.
+
+    Sends title/description/ingredients/instructions to the LLM together with the
+    combined preset directives and asks for a rewritten recipe in the SAME
+    language. Returns a NEW dict (does not mutate input). On any failure or when
+    no OpenAI client is configured, returns the original recipe unchanged with
+    `adapted=False` so the caller can surface a friendly message.
+    """
+    presets = [p for p in (presets or []) if p in ADAPT_PRESETS]
+    if not presets:
+        out = dict(recipe)
+        out['adapted'] = False
+        return out
+
+    if not (openai_client or openai_api_key):
+        logger.info("adapt_recipe_fields: no OpenAI client; skipping adaptation")
+        out = dict(recipe)
+        out['adapted'] = False
+        out['adapt_error'] = 'no_openai_key'
+        return out
+
+    lang = (target_lang or recipe.get('language') or 'ru').strip().lower()
+    lang_name = LANG_NAMES.get(lang, 'Russian')
+
+    payload = {
+        'title': recipe.get('title', ''),
+        'description': recipe.get('description', ''),
+        'ingredients': [str(x) for x in (recipe.get('ingredients') or []) if str(x).strip()],
+        'instructions': [str(x) for x in (recipe.get('instructions') or []) if str(x).strip()],
+        'preptime': recipe.get('preptime', 0),
+        'cooktime': recipe.get('cooktime', 0),
+        'totaltime': recipe.get('totaltime', 0),
+        'servings': recipe.get('servings', 4),
+    }
+
+    # Build the combined directive list.
+    directives = []
+    for key in presets:
+        if key == 'pantry':
+            pantry_clean = (pantry or '').strip()
+            if not pantry_clean:
+                continue
+            directives.append(
+                "Adapt the recipe to use mainly what the cook already has at home. "
+                "Available ingredients: " + pantry_clean + ". "
+                "Prefer these ingredients, minimize what must be bought, and you may "
+                "omit or substitute non-essential ingredients accordingly."
+            )
+        else:
+            instr = ADAPT_PRESETS[key]['instruction']
+            if instr:
+                directives.append(instr)
+
+    if not directives:
+        out = dict(recipe)
+        out['adapted'] = False
+        return out
+
+    directive_text = '\n'.join(f"- {d}" for d in directives)
+
+    prompt = (
+        "You are a culinary assistant. Adapt the following recipe according to ALL "
+        "of these requirements at once:\n"
+        f"{directive_text}\n\n"
+        f"Write the adapted recipe in {lang_name}. Keep it realistic and cookable. "
+        "Adjust ingredient quantities and instructions consistently with the changes. "
+        "Keep the SAME servings count unless a requirement implies otherwise. "
+        "Return ONLY valid JSON with exactly these keys: "
+        '"title" (string), "description" (string), '
+        '"ingredients" (array of strings, each like \"2 cups flour\"), '
+        '"instructions" (array of strings), '
+        '"preptime" (integer minutes), "cooktime" (integer minutes), '
+        '"totaltime" (integer minutes), "servings" (integer), '
+        '"summary" (string: one short sentence in ' + lang_name + ' describing what changed).\n\n'
+        f"Original recipe JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    try:
+        if OPENAI_NEW_API and openai_client:
+            resp = openai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=8000,
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+        elif openai_api_key:
+            resp = openai.ChatCompletion.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=8000,
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+        else:
+            out = dict(recipe)
+            out['adapted'] = False
+            out['adapt_error'] = 'no_openai_key'
+            return out
+
+        adapted = json.loads(content)
+    except (json.JSONDecodeError, KeyError, IndexError, AttributeError) as e:
+        logger.error(f"Recipe adaptation parse failed ({presets}): {e}")
+        out = dict(recipe)
+        out['adapted'] = False
+        out['adapt_error'] = 'llm_failed'
+        return out
+    except Exception as e:
+        logger.error(f"Recipe adaptation failed ({presets}): {e}")
+        out = dict(recipe)
+        out['adapted'] = False
+        out['adapt_error'] = 'llm_failed'
+        return out
+
+    out = dict(recipe)
+    if isinstance(adapted.get('title'), str) and adapted['title'].strip():
+        out['title'] = adapted['title'].strip()
+    if isinstance(adapted.get('description'), str):
+        out['description'] = adapted['description'].strip()
+    ai = adapted.get('ingredients')
+    if isinstance(ai, list) and ai:
+        out['ingredients'] = [str(x).strip() for x in ai if str(x).strip()]
+    an = adapted.get('instructions')
+    if isinstance(an, list) and an:
+        out['instructions'] = [str(x).strip() for x in an if str(x).strip()]
+    for k in ('preptime', 'cooktime', 'totaltime', 'servings'):
+        try:
+            if adapted.get(k) is not None:
+                out[k] = int(adapted[k])
+        except (TypeError, ValueError):
+            pass
+    out['language'] = lang
+    out['adapted'] = True
+    out['adapt_summary'] = adapted.get('summary', '') if isinstance(adapted.get('summary'), str) else ''
+    return out
+
+
+def _recipe_to_plain_dict(recipe) -> dict:
+    """Build a plain dict (string arrays) suitable for adaptation/scaling."""
+    d = recipe.to_dict(include_relationships=True)
+    # to_dict already returns ingredients/instructions as string arrays.
+    return d
+
+
+@app.route('/api/recipes/<int:recipe_id>/adapt', methods=['POST'])
+@require_auth
+def api_adapt_recipe(recipe_id):
+    """Produce an adaptation PREVIEW of a recipe. Does NOT persist anything.
+
+    Body:
+      {
+        "servings": 2|4|6,            # optional; algorithmic scaling
+        "presets": ["vegetarian",...],# optional; LLM dietary/goal presets
+        "pantry": "rice, eggs, ...",  # required only when "pantry" preset used
+        "lang": "ru"                  # optional; output language for LLM presets
+      }
+    Returns: { success, adapted, recipe, original, presets, servings,
+               summary, recompute_nutrition }
+    """
+    recipe = Recipe.query.get(recipe_id)
+    if recipe is None:
+        return jsonify({'success': False, 'error': 'Recipe not found'}), 404
+    if recipe.user_id != request.current_user.id:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+    data = request.get_json(silent=True) or {}
+    presets = data.get('presets') or []
+    if not isinstance(presets, list):
+        return jsonify({'success': False, 'error': 'presets must be a list'}), 400
+    bad = [p for p in presets if p not in ADAPT_PRESETS]
+    if bad:
+        return jsonify({'success': False, 'error': f'unknown presets: {bad}'}), 400
+
+    servings = data.get('servings')
+    if servings is not None:
+        try:
+            servings = int(servings)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'servings must be an integer'}), 400
+        if servings not in ADAPT_SERVING_TARGETS:
+            return jsonify({'success': False, 'error': f'servings must be one of {ADAPT_SERVING_TARGETS}'}), 400
+
+    pantry = (data.get('pantry') or '').strip()
+    if 'pantry' in presets and not pantry:
+        return jsonify({'success': False, 'error': 'pantry text required for pantry preset'}), 400
+
+    if not presets and servings is None:
+        return jsonify({'success': False, 'error': 'nothing to adapt: provide presets and/or servings'}), 400
+
+    lang = (data.get('lang') or recipe.language or 'ru').strip().lower()
+
+    base = _recipe_to_plain_dict(recipe)
+    work = dict(base)
+    adapted_flag = False
+    adapt_error = None
+    summary = ''
+
+    # 1) LLM dietary/goal presets first (rewrites text).
+    llm_presets = [p for p in presets]
+    if llm_presets:
+        work = adapt_recipe_fields(work, llm_presets, pantry=pantry, target_lang=lang)
+        adapted_flag = bool(work.get('adapted'))
+        adapt_error = work.get('adapt_error')
+        summary = work.get('adapt_summary', '')
+        if not adapted_flag and adapt_error:
+            # LLM failed / no key: surface error, don't fake a result.
+            status = 503 if adapt_error == 'no_openai_key' else 502
+            return jsonify({
+                'success': False,
+                'error': adapt_error,
+                'message': ('OpenAI key is not configured on the server'
+                            if adapt_error == 'no_openai_key'
+                            else 'Adaptation service failed, please try again'),
+            }), status
+
+    # 2) Algorithmic serving scaling (exact, free).
+    if servings is not None:
+        work = scale_recipe(work, servings)
+        work['servings'] = servings
+        adapted_flag = True
+
+    # 3) Recompute nutrition for the adapted ingredient list.
+    recompute = None
+    try:
+        target_servings = int(work.get('servings') or base.get('servings') or 4)
+        recompute = calculate_recipe_nutrition(work.get('ingredients', []), servings=target_servings)
+    except Exception as e:
+        logger.warning(f"adapt: nutrition recompute failed: {e}")
+        recompute = None
+
+    # Assemble preview payload (mirrors to_dict-ish shape the client renders).
+    preview = {
+        'title': work.get('title', base.get('title')),
+        'description': work.get('description', base.get('description')),
+        'imageurl': base.get('imageurl'),
+        'sourceurl': base.get('sourceurl'),
+        'preptime': work.get('preptime', base.get('preptime')),
+        'cooktime': work.get('cooktime', base.get('cooktime')),
+        'totaltime': work.get('totaltime', base.get('totaltime')),
+        'servings': work.get('servings', base.get('servings')),
+        'originalservings': base.get('servings'),
+        'difficulty': base.get('difficulty'),
+        'cuisinetype': base.get('cuisinetype'),
+        'cookingmethod': base.get('cookingmethod'),
+        'ingredients': work.get('ingredients', base.get('ingredients')),
+        'instructions': work.get('instructions', base.get('instructions')),
+        'categories': base.get('categories', []),
+        'language': work.get('language', base.get('language')),
+    }
+
+    return jsonify({
+        'success': True,
+        'adapted': adapted_flag,
+        'recipe': preview,
+        'original': {
+            'id': recipe.id,
+            'title': base.get('title'),
+            'servings': base.get('servings'),
+            'ingredients': base.get('ingredients'),
+            'instructions': base.get('instructions'),
+        },
+        'presets': presets,
+        'servings': servings,
+        'summary': summary,
+        'recompute_nutrition': recompute,
+    })
+
+
+@app.route('/api/recipes/adapt/save', methods=['POST'])
+@require_auth
+def api_adapt_recipe_save():
+    """Persist an accepted adaptation preview as a NEW recipe.
+
+    Body:
+      {
+        "adapted_from": <recipe_id>,        # required; source recipe
+        "presets": ["vegetarian", ...],     # optional; for lineage badge
+        "servings": 2|4|6,                  # optional; for lineage
+        "recipe": { ... preview payload ... } # required; from /adapt response
+      }
+    The source recipe must belong to the current user. Returns the new recipe.
+    """
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+
+    adapted_from = data.get('adapted_from')
+    preview = data.get('recipe') or {}
+    presets = data.get('presets') or []
+    servings = data.get('servings')
+
+    if not isinstance(preview, dict) or not preview.get('title'):
+        return jsonify({'success': False, 'error': 'recipe preview is required'}), 400
+
+    source = None
+    if adapted_from is not None:
+        source = Recipe.query.get(adapted_from)
+        if source is None:
+            return jsonify({'success': False, 'error': 'source recipe not found'}), 404
+        if source.user_id != user.id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+    # Build nutrition for the new recipe so cards/labels are populated.
+    nutrition_json = '[]'
+    per_serving_json = '[]'
+    try:
+        srv = int(preview.get('servings') or 4)
+        nutri = calculate_recipe_nutrition(preview.get('ingredients', []), servings=srv)
+        nutrition_json = json.dumps(nutri.get('total', {}))
+        per_serving_json = json.dumps(nutri.get('per_serving', {}))
+    except Exception as e:
+        logger.warning(f"adapt/save: nutrition compute failed: {e}")
+
+    new_recipe = Recipe(
+        user_id=user.id,
+        title=sanitize_string(preview.get('title')),
+        description=sanitize_string(preview.get('description', '')),
+        imageurl=sanitize_image_url(preview.get('imageurl', '')),
+        sourceurl=sanitize_string(preview.get('sourceurl', '')),
+        preptime=sanitize_integer(preview.get('preptime'), 0),
+        cooktime=sanitize_integer(preview.get('cooktime'), 0),
+        totaltime=sanitize_integer(preview.get('totaltime'), 0),
+        servings=sanitize_integer(preview.get('servings', 4), 4),
+        originalservings=sanitize_integer(preview.get('originalservings', preview.get('servings', 4)), 4),
+        difficulty=sanitize_string(preview.get('difficulty', 'Medium')),
+        nutritiondata=nutrition_json,
+        nutritionperserving=per_serving_json,
+        cuisinetype=sanitize_string(preview.get('cuisinetype', '')),
+        cookingmethod=sanitize_string(preview.get('cookingmethod', '')),
+        language=sanitize_string(preview.get('language', source.language if source else 'ru')),
+        adaptedfrom=source.id if source else None,
+        adaptationpresets=json.dumps([p for p in presets if isinstance(p, str)]),
+        is_saved=True,
+    )
+    db.session.add(new_recipe)
+    db.session.flush()
+
+    for i, ing_text in enumerate(preview.get('ingredients', [])):
+        if isinstance(ing_text, str) and ing_text.strip():
+            parsed = clean_ingredient_text(ing_text)
+            db.session.add(Ingredient(
+                recipe_id=new_recipe.id,
+                ingredient=parsed['ingredient'],
+                quantity=parsed['quantity'],
+                unit=parsed['unit'],
+                originalquantity=parsed['quantity'],
+                originalunit=parsed['unit'],
+                order_index=i,
+            ))
+
+    for step_no, instr_text in enumerate(preview.get('instructions', []), start=1):
+        if isinstance(instr_text, str) and instr_text.strip():
+            db.session.add(Instruction(
+                recipe_id=new_recipe.id,
+                step_number=step_no,
+                instruction=sanitize_string(instr_text),
+            ))
+
+    # Carry over categories from the source recipe, if any.
+    if source:
+        for rc in source.categories:
+            if rc.category_id:
+                db.session.add(RecipeCategory(recipe_id=new_recipe.id, category_id=rc.category_id))
+
+    db.session.commit()
+    db.session.refresh(new_recipe)
+    logger.info(f"✅ Saved adapted recipe {new_recipe.id} (from {adapted_from}, presets={presets})")
+    return jsonify({'success': True, 'recipe': new_recipe.to_dict()}), 201
+
+
+# ── Pantry (home inventory) ──────────────────────────────────────────────────
+def _pantry_normalised_names(user_id: int) -> dict:
+    """Return {normalised_name: PantryItem} for a user's pantry."""
+    result = {}
+    for it in PantryItem.query.filter_by(user_id=user_id).all():
+        key = _normalise_ingredient_name(it.name)
+        if key:
+            result[key] = it
+    return result
+
+
+def compute_pantry_match(recipe, pantry_names: Optional[dict] = None) -> dict:
+    """How many of a recipe's ingredients the user already has at home.
+
+    Matching is by normalised name only. Returns
+    {have, total, have_names: [...]}.
+    """
+    if pantry_names is None:
+        pantry_names = _pantry_normalised_names(recipe.user_id) if recipe.user_id else {}
+    total = 0
+    have = 0
+    have_names = []
+    seen = set()
+    for ing in recipe.ingredients:
+        key = _normalise_ingredient_name(ing.ingredient)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        total += 1
+        if key in pantry_names:
+            have += 1
+            have_names.append(ing.ingredient.strip())
+    return {'have': have, 'total': total, 'have_names': have_names}
+
+
+@app.route('/api/pantry', methods=['GET', 'POST'])
+@require_auth
+def api_pantry():
+    user = request.current_user
+
+    if request.method == 'GET':
+        items = (PantryItem.query
+                 .filter_by(user_id=user.id)
+                 .order_by(PantryItem.category.asc(), PantryItem.name.asc())
+                 .all())
+        return jsonify({
+            'success': True,
+            'pantry_items': [it.to_dict() for it in items],
+        })
+
+    # POST — add a single item
+    data = request.get_json(silent=True) or {}
+    name = sanitize_string(data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+    quantity = sanitize_string(str(data.get('quantity') or '')).strip() or None
+    unit = sanitize_string(str(data.get('unit') or '')).strip() or None
+    # Dedupe by normalised name (consistent with bulk-add and cook-deduction,
+    # which match by normalised name). Adding an item that already exists
+    # updates the existing row's quantity/unit instead of creating a duplicate,
+    # so the pantry never holds two rows for the same ingredient.
+    key = _normalise_ingredient_name(name)
+    existing = None
+    if key:
+        existing = next(
+            (it for it in PantryItem.query.filter_by(user_id=user.id).all()
+             if _normalise_ingredient_name(it.name) == key),
+            None,
+        )
+    if existing is not None:
+        if quantity is not None:
+            existing.quantity = quantity
+        if unit is not None:
+            existing.unit = unit
+        db.session.commit()
+        return jsonify({'success': True, 'pantry_item': existing.to_dict()}), 200
+    item = PantryItem(
+        user_id=user.id,
+        name=name,
+        quantity=quantity,
+        unit=unit,
+        category=categorize_ingredient(name),
+    )
+    db.session.add(item)
+    db.session.commit()
+    return jsonify({'success': True, 'pantry_item': item.to_dict()}), 201
+
+
+@app.route('/api/pantry/bulk', methods=['POST'])
+@require_auth
+def api_pantry_bulk():
+    """Bulk-add pantry items. Body: {items: [str | {name,quantity,unit}]}.
+    Each item is auto-categorised. Existing items (same normalised name) are
+    skipped so the call is idempotent.
+    """
+    user = request.current_user
+    data = request.get_json(silent=True) or {}
+    raw_items = data.get('items') or []
+    existing = set(_pantry_normalised_names(user.id).keys())
+    created = []
+    for raw in raw_items:
+        if isinstance(raw, str):
+            name, quantity, unit = raw.strip(), '', ''
+        elif isinstance(raw, dict):
+            name = sanitize_string(str(raw.get('name') or '')).strip()
+            quantity = sanitize_string(str(raw.get('quantity') or '')).strip()
+            unit = sanitize_string(str(raw.get('unit') or '')).strip()
+        else:
+            continue
+        if not name:
+            continue
+        key = _normalise_ingredient_name(name)
+        if not key or key in existing:
+            continue
+        existing.add(key)
+        item = PantryItem(
+            user_id=user.id,
+            name=name,
+            quantity=quantity or None,
+            unit=unit or None,
+            category=categorize_ingredient(name),
+        )
+        db.session.add(item)
+        created.append(item)
+    db.session.commit()
+    return jsonify({
+        'success': True,
+        'created': [it.to_dict() for it in created],
+        'created_count': len(created),
+    }), 201
+
+
+@app.route('/api/pantry/<int:item_id>', methods=['PATCH', 'DELETE'])
+@require_auth
+def api_pantry_item(item_id):
+    user = request.current_user
+    item = PantryItem.query.filter_by(id=item_id, user_id=user.id).first()
+    if not item:
+        return jsonify({'error': 'Pantry item not found'}), 404
+
+    if request.method == 'DELETE':
+        db.session.delete(item)
+        db.session.commit()
+        return jsonify({'success': True})
+
+    # PATCH
+    data = request.get_json(silent=True) or {}
+    if 'name' in data:
+        new_name = sanitize_string(str(data.get('name') or '')).strip()
+        if not new_name:
+            return jsonify({'error': 'name cannot be empty'}), 400
+        item.name = new_name
+        item.category = categorize_ingredient(new_name)
+    if 'quantity' in data:
+        item.quantity = sanitize_string(str(data.get('quantity') or '')).strip() or None
+    if 'unit' in data:
+        item.unit = sanitize_string(str(data.get('unit') or '')).strip() or None
+    db.session.commit()
+    return jsonify({'success': True, 'pantry_item': item.to_dict()})
+
+
+@app.route('/api/recipes/<int:recipe_id>/cook', methods=['POST'])
+@require_auth
+def api_recipe_cook(recipe_id):
+    """Mark a recipe as cooked and deduct the selected ingredients from pantry.
+
+    Body: {ingredient_names: [str, ...]}. Matching is by normalised name.
+    Matched pantry items are removed (we don't track decremental quantities).
+    Returns the list of removed pantry item names.
+    """
+    user = request.current_user
+    recipe = Recipe.query.filter_by(id=recipe_id, user_id=user.id).first()
+    if not recipe:
+        return jsonify({'error': 'Recipe not found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    names = data.get('ingredient_names')
+    # If no explicit selection, default to all recipe ingredients.
+    if not names:
+        names = [ing.ingredient for ing in recipe.ingredients]
+
+    wanted = set()
+    for n in names:
+        key = _normalise_ingredient_name(n)
+        if key:
+            wanted.add(key)
+
+    removed = []
+    for it in PantryItem.query.filter_by(user_id=user.id).all():
+        key = _normalise_ingredient_name(it.name)
+        if key in wanted:
+            removed.append(it.name)
+            db.session.delete(it)
+    db.session.commit()
+    return jsonify({
+        'success': True,
+        'removed': removed,
+        'removed_count': len(removed),
+    })
+
+
+@app.route('/api/recipes/suggest-from-pantry', methods=['GET'])
+@require_auth
+def api_recipes_suggest_from_pantry():
+    """Suggest recipes the user can make from what's in their pantry.
+
+    Returns ALL of the user's recipes, each annotated with a pantry_match
+    ({have, total, have_names}) and a match_ratio, sorted by match_ratio
+    descending (then by have count, then newest first). Matching is by
+    normalised ingredient name only — no quantity comparison (consistent
+    with pantry-match v1).
+
+    Optional query params:
+      ?limit=<int>   cap the number of recipes returned (default: all)
+    """
+    user = request.current_user
+    pantry_names = _pantry_normalised_names(user.id)
+
+    recipes = (Recipe.query
+               .filter_by(user_id=user.id)
+               .order_by(Recipe.created_at.desc())
+               .all())
+
+    suggestions = []
+    for recipe in recipes:
+        match = compute_pantry_match(recipe, pantry_names=pantry_names)
+        total = match['total']
+        ratio = (match['have'] / total) if total else 0.0
+        payload = recipe.to_dict(include_relationships=True)
+        payload['pantry_match'] = match
+        payload['match_ratio'] = round(ratio, 4)
+        # Use recipe id as a stable, comparable newest-first tiebreaker
+        # (avoids naive/aware datetime comparison issues).
+        suggestions.append((ratio, match['have'], recipe.id, payload))
+
+    # Sort: ratio desc, then absolute have count desc, then newest (higher id) first.
+    suggestions.sort(
+        key=lambda t: (t[0], t[1], t[2]),
+        reverse=True,
+    )
+
+    ordered = [p for _, _, _, p in suggestions]
+
+    limit = request.args.get('limit', type=int)
+    if limit is not None and limit > 0:
+        ordered = ordered[:limit]
+
+    return jsonify({
+        'success': True,
+        'recipes': ordered,
+        'pantry_count': len(pantry_names),
+    })
 
 
 # Create database tables and run migrations
