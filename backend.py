@@ -3199,6 +3199,41 @@ def health_check():
         'timestamp': utcnow().isoformat(),
         'openai_configured': bool(openai_client)
     })
+
+
+# ── Product of the Day ───────────────────────────────────────────────────────
+# The feature's data module and its images live under backend/ (kept there by
+# request). This file (backend.py) is a *module* at the repo root, so backend/
+# must NOT become a package — an __init__.py there would shadow this module and
+# break `gunicorn backend:app`. We therefore load the sibling data module by
+# file path and serve its images from backend/static/potd explicitly.
+import importlib.util as _importlib_util
+from flask import send_from_directory as _send_from_directory
+
+_POTD_BASE_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backend')
+_POTD_MODULE_PATH = os.path.join(_POTD_BASE_DIR, 'product_of_the_day.py')
+_POTD_IMAGE_DIR   = os.path.join(_POTD_BASE_DIR, 'static', 'potd')
+
+_potd_spec = _importlib_util.spec_from_file_location('product_of_the_day', _POTD_MODULE_PATH)
+product_of_the_day = _importlib_util.module_from_spec(_potd_spec)
+_potd_spec.loader.exec_module(product_of_the_day)
+
+
+@app.route('/api/product-of-the-day', methods=['GET'])
+def product_of_the_day_endpoint():
+    """Return today's curated product (localized via ?lang=). Also served at
+    /api/v1/product-of-the-day by the version-rewrite middleware."""
+    lang = request.args.get('lang', 'en')
+    return jsonify(product_of_the_day.get_product_of_the_day(lang=lang))
+
+
+@app.route('/static/potd/<path:filename>', methods=['GET'])
+def product_of_the_day_image(filename):
+    """Serve Product-of-the-Day images from backend/static/potd. This explicit
+    rule is more specific than Flask's default /static/<path> and wins routing."""
+    return _send_from_directory(_POTD_IMAGE_DIR, filename)
+
+
 # Unit conversion functions
 @app.route('/')
 def index():
